@@ -1,7 +1,7 @@
 from setuptools import setup
  
 setup(
-     name='sf_object_tools',    # This is the name of your PyPI-package.
+     name='sf_object_updates',    # This is the name of your PyPI-package.
      version='0.1',                          # Update the version number for new releases
      author='Dan Aronson',
      author_email='dan@openfiber.net',
