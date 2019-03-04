@@ -8,6 +8,7 @@ from threading import Thread, Lock, current_thread
 import time
 import json
 from botocore.exceptions import ClientError
+from datetime import datetime
 logger = logging.getLogger(__name__)
 
 DEFAULT_REGION_NAME = 'us-west-1'
@@ -17,8 +18,8 @@ RETRY_EXCEPTIONS = ('ProvisionedThroughputExceededException',
 
 
 class SFUpdates:
-    def __init__(self, stream_name, region_name = DEFAULT_REGION_NAME, shard_position_table_name = 'shard_positions',
-                 shard_position_region_name = DEFAULT_REGION_NAME):
+    def __init__(self, stream_name = 'sf_object_updates', region_name = DEFAULT_REGION_NAME, shard_position_table_name = 'shard_positions',
+                 shard_position_region_name = 'us-west-2'):
         self.stream_name = stream_name
         self.kinesis_client = boto3.client('kinesis', region_name = region_name)
         self.shard_position_table = boto3.resource('dynamodb', region_name = 'us-west-2').Table(shard_position_table_name)
@@ -35,13 +36,19 @@ class SFUpdates:
                 thread.join()
         logger.info('stopped')
 
-    def run(self, callback, shard_number):
-        logger.info('running thread for shard_number %d' % shard_number)
+    def get_shard_iterator(self, shard_number):
         with self.lock:
             shard_position = self.shard_positions[str(shard_number)]
             shard_id = self.shards[shard_number]['ShardId']
-        if '' == shard_position:
-            logger.info('not found any position, starting at oldest record in shard')
+        if 'NOW' == shard_position:
+            now = datetime.utcnow()
+            logger.info('starting at datetime: %s' % now)
+            shard_iterator = self.kinesis_client.get_shard_iterator(StreamName=self.stream_name,
+                                                                    ShardId=shard_id,
+                                                                    ShardIteratorType='AT_TIMESTAMP',
+                                                                    Timestamp = now)
+        elif 'START' == shard_position:
+            logger.info('starting at trim horizon')
             shard_iterator = self.kinesis_client.get_shard_iterator(StreamName=self.stream_name,
                                                                     ShardId=shard_id,
                                                                     ShardIteratorType='TRIM_HORIZON')
@@ -51,9 +58,13 @@ class SFUpdates:
                                                                     ShardId=shard_id,
                                                                     ShardIteratorType='AFTER_SEQUENCE_NUMBER',
                                                                     StartingSequenceNumber=shard_position)
+        return shard_iterator['ShardIterator']
 
+
+    def run(self, callback, shard_number):
+        logger.info('running a thread for shard_number %d' % shard_number)
         while not self._stop:
-            my_shard_iterator = shard_iterator['ShardIterator']
+            my_shard_iterator = self.get_shard_iterator(shard_number)
             while True:
                 if self._stop:
                     break
@@ -61,6 +72,10 @@ class SFUpdates:
                     record_response = self.kinesis_client.get_records(ShardIterator=my_shard_iterator, Limit=1000)
                     logger.info('record response: %s' % record_response)
                 except ClientError as err:
+                    if 'ExpiredIteratorException' == err.response['Error']['Code']:
+                        logger.warning('iterator expired, getting new one')
+                        my_shard_iterator = self.get_shard_iterator(shard_number)
+                        continue
                     if err.response['Error']['Code'] not in RETRY_EXCEPTIONS:
                         self.stop()
                         raise
@@ -81,7 +96,7 @@ class SFUpdates:
                         with self.lock:
                             self.shard_positions[str(shard_number)] = record['SequenceNumber']
                             logger.info('storing %s in dynamodb table' % self.shard_positions)
-                            self.shard_position_table.put_item(Item={'stream_name':self.stream_name, 'shard_positions':json.dumps(self.shard_positions)})
+                            self.shard_position_table.put_item(Item={'client_id': self.client_id, 'shard_positions':json.dumps(self.shard_positions)})
                         # wait for 5 seconds
                     except:
                         # if there is an error, then shutdown all threads
@@ -98,22 +113,29 @@ class SFUpdates:
         logger.info('writing %s to kinesis stream' % data)
         return self.kinesis_client.put_record(StreamName=self.stream_name, Data=data, PartitionKey=partition_key)
     
-    def start(self, callback, from_start = False):
-        """call callback function for each sf update, arguments will be:
-        OBJECT-TYPE, OBJECT-INSTANCE-ID, OPERATION-TYPE and OBJECT-FIELDS
+    def start(self, callback, client_id, start = ''):
+        """call callback function for each sf update, arguments will be :
+        OBJECT-TYPE, OBJECT-INSTANCE-ID, OPERATION-TYPE
+
+        Start can be of:
+          'START' which will get all objects since the current start of the data stream
+          'NOW' which will get all objects since the current time
+
+        If start is not passed or has a value of START, the external datastream service may take a while to get caught up
         """
         self._stop = False
+        self.client_id = client_id
         response = self.kinesis_client.describe_stream(StreamName = self.stream_name)
         self.shards = response['StreamDescription']['Shards']
         logger.info('Found %d shards for stream %s' % (len(self.shards), self.stream_name))
 
         response = {}
-        if not from_start:
-            response = self.shard_position_table.get_item(Key={'stream_name': self.stream_name})
-        if 'Item' in response:
-            self.shard_positions = json.loads(response['Item']['shard_positions'])
+        if not start:
+            response = self.shard_position_table.get_item(Key={'client_id':self.client_id})
+            if 'Item' in response:
+                self.shard_positions = json.loads(response['Item']['shard_positions'])
         else:
-            self.shard_positions = {str(j):'' for j in range(0, len(self.shards))}
+            self.shard_positions = {str(j):start for j in range(0, len(self.shards))}
         self.threads = [Thread(target=self.run, args=(callback, j)) for j in range(0, len(self.shards))]
         for thread in self.threads:
             thread.start()
