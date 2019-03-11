@@ -92,11 +92,11 @@ class SFUpdates:
                 for record in record_response['Records']:
                     data = json.loads(record['Data'])
                     try:
-                        callback(data)
+                        callback(data, client_name = self.client_name, **self.kwargs)
                         with self.lock:
                             self.shard_positions[str(shard_number)] = record['SequenceNumber']
                             logger.info('storing %s in dynamodb table' % self.shard_positions)
-                            self.shard_position_table.put_item(Item={'client_id': self.client_id, 'shard_positions':json.dumps(self.shard_positions)})
+                            self.shard_position_table.put_item(Item={'client_id': self.client_name, 'shard_positions':json.dumps(self.shard_positions)})
                         # wait for 5 seconds
                     except:
                         # if there is an error, then shutdown all threads
@@ -113,7 +113,7 @@ class SFUpdates:
         logger.info('writing %s to kinesis stream' % data)
         return self.kinesis_client.put_record(StreamName=self.stream_name, Data=data, PartitionKey=partition_key)
     
-    def start(self, callback, client_id, start = ''):
+    def start(self, callback, client_name, start = '', **kwargs):
         """call callback function for each sf update, arguments will be :
         OBJECT-TYPE, OBJECT-INSTANCE-ID, OPERATION-TYPE
 
@@ -124,17 +124,21 @@ class SFUpdates:
         If start is not passed or has a value of START, the external datastream service may take a while to get caught up
         """
         self._stop = False
-        self.client_id = client_id
+        self.client_name = client_name
         response = self.kinesis_client.describe_stream(StreamName = self.stream_name)
         self.shards = response['StreamDescription']['Shards']
         logger.info('Found %d shards for stream %s' % (len(self.shards), self.stream_name))
 
         response = {}
-        if not start:
+        self.shard_positions = None
+        self.kwargs = kwargs
+        if 0 == len(start):
             response = self.shard_position_table.get_item(Key={'client_id':self.client_id})
             if 'Item' in response:
                 self.shard_positions = json.loads(response['Item']['shard_positions'])
-        else:
+            else:
+                start = 'START'
+        if not self.shard_positions:
             self.shard_positions = {str(j):start for j in range(0, len(self.shards))}
         self.threads = [Thread(target=self.run, args=(callback, j)) for j in range(0, len(self.shards))]
         for thread in self.threads:
